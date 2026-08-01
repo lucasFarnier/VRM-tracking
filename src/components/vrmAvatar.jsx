@@ -1,11 +1,10 @@
 import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
 import { useAnimations, useFBX, useGLTF } from "@react-three/drei";
 import { useFrame, useThree } from "@react-three/fiber";
-import { Face, Hand, Pose } from "kalidokit";
-import { useControls, button } from "leva";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bone, Skeleton, SkinnedMesh, BufferGeometry, Float32BufferAttribute, Vector3, Matrix4, Quaternion, Euler, Object3D } from "three";
-import { CCDIKSolver } from "three/examples/jsm/animation/CCDIKSolver.js";
+import { Face, Pose, Hand } from "kalidokit"; // Brought Hand back
+import { useControls } from "leva";
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import { Euler, Object3D, Quaternion, Vector3 } from "three";
 import { lerp } from "three/src/math/MathUtils.js";
 import { useVideoRecognition } from "../hooks/useVideoRecognition";
 import { remapMixamoAnimationToVrm } from "../utils/remapMixamoAnimationToVrm";
@@ -13,431 +12,196 @@ import { remapMixamoAnimationToVrm } from "../utils/remapMixamoAnimationToVrm";
 const tmpVec3 = new Vector3();
 const tmpQuat = new Quaternion();
 const tmpEuler = new Euler();
-const tmpMatrix = new Matrix4();
 
-function calculateCustomWristRotation(landmarks, isRightHand, lowerArmBone) {
-    if (!landmarks || landmarks.length < 21 || !lowerArmBone) return null;
-
-    const wrist = new Vector3(landmarks[0].x, -landmarks[0].y, landmarks[0].z);
-    const indexKnuckle = new Vector3(landmarks[5].x, -landmarks[5].y, landmarks[5].z);
-    const pinkyKnuckle = new Vector3(landmarks[17].x, -landmarks[17].y, landmarks[17].z);
-
-    const toIndex = new Vector3().subVectors(indexKnuckle, wrist).normalize();
-    const toPinky = new Vector3().subVectors(pinkyKnuckle, wrist).normalize();
-
-    const palmNormal = new Vector3();
-    if (isRightHand) {
-        palmNormal.crossVectors(toPinky, toIndex).normalize();
-    } else {
-        palmNormal.crossVectors(toIndex, toPinky).normalize();
-    }
-
-    const forward = toIndex.clone();
-    const up = palmNormal.clone();
-    const right = new Vector3().crossVectors(forward, up).normalize();
-
-    const rotationMatrix = new Matrix4().makeBasis(right, up, forward);
-    const desiredWorldQuat = new Quaternion().setFromRotationMatrix(rotationMatrix);
-
-    // Convert World Rotation -> Local Bone Rotation space
-    const lowerArmWorldQuat = new Quaternion();
-    lowerArmBone.getWorldQuaternion(lowerArmWorldQuat);
-
-    const localQuat = new Quaternion()
-        .copy(lowerArmWorldQuat)
-        .invert()
-        .multiply(desiredWorldQuat);
-
-    return localQuat;
-}
-
-function solveHandQuaternion(landmarks, isRightHand) {
-    if (!landmarks || landmarks.length < 21) return null;
-
-    const wrist = landmarks[0];
-    const indexMCP = landmarks[5];
-    const middleMCP = landmarks[9];
-    const pinkyMCP = landmarks[17];
-
-    const toMiddle = new Vector3(
-        middleMCP.x - wrist.x,
-        -(middleMCP.y - wrist.y),
-        middleMCP.z - wrist.z
-    ).normalize();
-
-    const toPinky = new Vector3(
-        pinkyMCP.x - wrist.x,
-        -(pinkyMCP.y - wrist.y),
-        pinkyMCP.z - wrist.z
-    ).normalize();
-
-    const palmNormal = isRightHand
-        ? new Vector3().crossVectors(toPinky, toMiddle).normalize()
-        : new Vector3().crossVectors(toMiddle, toPinky).normalize();
-
-    const handX = toMiddle.clone();
-    const handY = palmNormal.clone().negate();
-    const handZ = new Vector3().crossVectors(handX, handY).normalize();
-    const handY2 = new Vector3().crossVectors(handZ, handX).normalize();
-
-    tmpMatrix.makeBasis(handX, handY2, handZ);
-    return new Quaternion().setFromRotationMatrix(tmpMatrix);
-}
-
-export const VRMAvatar = ({ avatar, ...props }) => {
-    const { scene, userData } = useGLTF(
-        `models/${avatar}`,
-        undefined,
-        undefined,
-        (loader) => {
-            loader.register((parser) => {
-                return new VRMLoaderPlugin(parser);
-            });
-        }
-    );
+export const VRMavatar = ({ avatar, ...props }) => {
+    const { scene, userData } = useGLTF(`models/${avatar}`, undefined, undefined, (loader) => {
+        loader.register((parser) => {
+            return new VRMLoaderPlugin(parser);
+        });
+    });
 
     const assetA = useFBX("models/animations/Swing Dancing.fbx");
     const assetB = useFBX("models/animations/Thriller Part 2.fbx");
     const assetC = useFBX("models/animations/Breathing Idle.fbx");
-
     const currentVrm = userData.vrm;
 
-    const animationClipA = useMemo(() => {
-        const clip = remapMixamoAnimationToVrm(currentVrm, assetA);
-        clip.name = "Swing Dancing";
-        return clip;
-    }, [assetA, currentVrm]);
+    const animationClipA = useMemo(() => { const clip = remapMixamoAnimationToVrm(currentVrm, assetA); clip.name = "Swing Dancing"; return clip; }, [assetA, currentVrm]);
+    const animationClipB = useMemo(() => { const clip = remapMixamoAnimationToVrm(currentVrm, assetB); clip.name = "Thriller Part 2"; return clip; }, [assetB, currentVrm]);
+    const animationClipC = useMemo(() => { const clip = remapMixamoAnimationToVrm(currentVrm, assetC); clip.name = "Idle"; return clip; }, [assetC, currentVrm]);
 
-    const animationClipB = useMemo(() => {
-        const clip = remapMixamoAnimationToVrm(currentVrm, assetB);
-        clip.name = "Thriller Part 2";
-        return clip;
-    }, [assetB, currentVrm]);
+    const { actions } = useAnimations([animationClipA, animationClipB, animationClipC], currentVrm?.scene);
 
-    const animationClipC = useMemo(() => {
-        const clip = remapMixamoAnimationToVrm(currentVrm, assetC);
-        clip.name = "Idle";
-        return clip;
-    }, [assetC, currentVrm]);
-
-    const { actions } = useAnimations(
-        [animationClipA, animationClipB, animationClipC],
-        currentVrm.scene
-    );
-
-    // IK & POSE REFS
-    const ikSolvers = useRef({ left: null, right: null });
-    const ikTargets = useRef({ left: null, right: null });
-    const dummyBones = useRef({ left: {}, right: {} });
-    const dummyMeshes = useRef({ left: null, right: null });
-    const rawPose3D = useRef(null);
-
-    const restPoseQuats = useRef({});
     useEffect(() => {
+        if (!userData?.vrm) return;
         const vrm = userData.vrm;
-        if (!vrm) return;
-
-        if (!vrm.scene.userData.isOptimized) {
-            try {
-                VRMUtils.removeUnnecessaryVertices(scene);
-                VRMUtils.combineSkeletons(scene);
-                VRMUtils.combineMorphs(vrm);
-            } catch (e) {
-                console.warn("VRM optimization skipped:", e);
-            }
-            vrm.scene.userData.isOptimized = true;
-        }
-
-        vrm.scene.traverse((obj) => {
-            obj.frustumCulled = false;
-        });
-
-        const bonesToSave = [
-            "leftUpperArm", "leftLowerArm", "leftHand",
-            "rightUpperArm", "rightLowerArm", "rightHand"
-        ];
-
-        bonesToSave.forEach(boneName => {
-            const bone = vrm.humanoid.getNormalizedBoneNode(boneName);
-            if (bone) restPoseQuats.current[boneName] = bone.quaternion.clone();
-        });
-
-        const setupArmIK = (side, upperName, lowerName, handName) => {
-            const vrmUpper = vrm.humanoid.getNormalizedBoneNode(upperName);
-            const vrmLower = vrm.humanoid.getNormalizedBoneNode(lowerName);
-            const vrmHand = vrm.humanoid.getNormalizedBoneNode(handName);
-            if (!vrmUpper || !vrmLower || !vrmHand) return;
-
-            const dShoulder = new Bone();
-            const dElbow = new Bone();
-            const dWrist = new Bone();
-            const dTarget = new Bone();
-
-            dShoulder.position.copy(vrmUpper.position);
-            dElbow.position.copy(vrmLower.position);
-            dWrist.position.copy(vrmHand.position);
-
-            dShoulder.add(dElbow);
-            dElbow.add(dWrist);
-
-            const geo = new BufferGeometry();
-            geo.setAttribute('position', new Float32BufferAttribute([0, 0, 0], 3));
-            // Add blank skin weights and indices so Three.js SkinnedMesh doesn't crash
-            geo.setAttribute('skinIndex', new Float32BufferAttribute([0, 0, 0, 0], 4));
-            geo.setAttribute('skinWeight', new Float32BufferAttribute([1, 0, 0, 0], 4));
-
-            const dummyMesh = new SkinnedMesh(geo, undefined);
-            dummyMesh.frustumCulled = false; // Prevent projection bounding sphere crashes
-            dummyMesh.add(dShoulder);
-            dummyMesh.add(dTarget);
-
-            vrm.scene.add(dummyMesh);
-            dummyMeshes.current[side] = dummyMesh;
-
-            const skeleton = new Skeleton([dShoulder, dElbow, dWrist, dTarget]);
-            dummyMesh.bind(skeleton);
-
-            const iks = [{
-                target: 3,
-                effector: 2,
-                links: [{ index: 1 }, { index: 0 }],
-                iteration: 5
-            }];
-
-            const solver = new CCDIKSolver(dummyMesh, iks);
-
-            ikSolvers.current[side] = solver;
-            ikTargets.current[side] = dTarget;
-            dummyBones.current[side] = { shoulder: dShoulder, elbow: dElbow };
-        };
-
-        setupArmIK('left', 'leftUpperArm', 'leftLowerArm', 'leftHand');
-        setupArmIK('right', 'rightUpperArm', 'rightLowerArm', 'rightHand');
-
-        return () => {
-            if (dummyMeshes.current.left) dummyMeshes.current.left.removeFromParent();
-            if (dummyMeshes.current.right) dummyMeshes.current.right.removeFromParent();
-        };
-    }, [scene, userData.vrm]);
+        VRMUtils.removeUnnecessaryVertices(scene);
+        VRMUtils.combineSkeletons(scene);
+        VRMUtils.combineMorphs(vrm);
+        vrm.scene.traverse((obj) => { obj.frustumCulled = false; });
+    }, [scene, userData]);
 
     const setResultsCallback = useVideoRecognition((state) => state.setResultsCallback);
     const videoElement = useVideoRecognition((state) => state.videoElement);
+    const rawResults = useRef();
+
+    // Kalidokit Refs
     const riggedFace = useRef();
     const riggedPose = useRef();
     const riggedLeftHand = useRef();
     const riggedRightHand = useRef();
 
-    const rawLeftHandData = useRef(null);
-    const rawRightHandData = useRef(null);
+    const resultsCallback = useCallback((results) => {
+        if (!videoElement || !currentVrm) return;
+        rawResults.current = results;
 
-    const handCalibData = useRef({ leftHand: null, rightHand: null });
-    const calibrateFlag = useRef(false);
+        if (results.faceLandmarks) {
+            riggedFace.current = Face.solve(results.faceLandmarks, { runtime: "mediapipe", video: videoElement, imageSizes: { width: 640, height: 480 }, smoothBlink: false, blinkSettings: [0.25, 0.75] });
+        }
+        if (results.za && results.poseLandmarks) {
+            riggedPose.current = Pose.solve(results.za, results.poseLandmarks, { runtime: "mediapipe", video: videoElement });
+        }
 
-    const resultsCallback = useCallback(
-        (results) => {
-            if (!videoElement || !currentVrm) return;
+        // FIXED BUG: You were passing left landmarks to the right hand in your original code!
+        if (results.leftHandLandmarks) {
+            riggedLeftHand.current = Hand.solve(results.leftHandLandmarks, "Left");
+        }
+        if (results.rightHandLandmarks) {
+            riggedRightHand.current = Hand.solve(results.rightHandLandmarks, "Right");
+        }
+    }, [videoElement, currentVrm]);
 
-            // Fallback safely to poseLandmarks if poseWorldLandmarks is missing
-            if (results.poseWorldLandmarks || results.poseLandmarks) {
-                rawPose3D.current = results.poseWorldLandmarks || results.poseLandmarks;
-            }
+    useEffect(() => { setResultsCallback(resultsCallback); }, [resultsCallback, setResultsCallback]);
 
-            if (results.faceLandmarks) {
-                riggedFace.current = Face.solve(results.faceLandmarks, {
-                    runtime: "mediapipe",
-                    video: videoElement,
-                    imageSize: { width: 640, height: 480 },
-                    smoothBlink: false,
-                    blinkSettings: [0.25, 0.75],
-                });
-            }
-
-            if (results.za && results.poseLandmarks) {
-                riggedPose.current = Pose.solve(results.za, results.poseLandmarks, {
-                    runtime: "mediapipe",
-                    video: videoElement,
-                });
-            }
-
-            if (results.leftHandLandmarks) {
-                rawRightHandData.current = {
-                    landmarks: results.leftHandLandmarks,
-                    isRightHand: true,
-                };
-                riggedRightHand.current = Hand.solve(results.leftHandLandmarks, "Right");
-            }
-            if (results.rightHandLandmarks) {
-                rawLeftHandData.current = {
-                    landmarks: results.rightHandLandmarks,
-                    isRightHand: false,
-                };
-                riggedLeftHand.current = Hand.solve(results.rightHandLandmarks, "Left");
-            }
-        },
-        [videoElement, currentVrm]
-    );
+    const { angry, sad, happy, animation } = useControls("vrm", { angry: { value: 0, min: 0, max: 1 }, sad: { value: 0, min: 0, max: 1 }, happy: { value: 0, min: 0, max: 1 }, animation: { options: ["None", "Idle", "Swing Dancing", "Thriller Part 2"], value: "Idle" } });
 
     useEffect(() => {
-        setResultsCallback(resultsCallback);
-    }, [resultsCallback]);
-
-    const calibrateTimer = useRef(null);
-    const [calibCountdown, setCalibCountdown] = useState(null);
-
-    const {
-        aa, ih, ee, oh, ou,
-        blinkLeft, blinkRight,
-        angry, sad, happy,
-        animation,
-        useCustomHandRotation,
-    } = useControls("VRM", {
-        aa: { value: 0, min: 0, max: 1 },
-        ih: { value: 0, min: 0, max: 1 },
-        ee: { value: 0, min: 0, max: 1 },
-        oh: { value: 0, min: 0, max: 1 },
-        ou: { value: 0, min: 0, max: 1 },
-        blinkLeft: { value: 0, min: 0, max: 1 },
-        blinkRight: { value: 0, min: 0, max: 1 },
-        angry: { value: 0, min: 0, max: 1 },
-        sad: { value: 0, min: 0, max: 1 },
-        happy: { value: 0, min: 0, max: 1 },
-        animation: {
-            options: ["None", "Idle", "Swing Dancing", "Thriller Part 2"],
-            value: "Idle",
-        },
-        useCustomHandRotation: { value: true, label: "Custom Hand Rot" },
-        calibrateHands: button(() => {
-            if (calibrateTimer.current) return;
-            let seconds = 5;
-            setCalibCountdown(seconds);
-            const tick = () => {
-                seconds--;
-                setCalibCountdown(seconds >= 0 ? seconds : null);
-                if (seconds >= 0) {
-                    calibrateTimer.current = setTimeout(tick, 1000);
-                } else {
-                    calibrateFlag.current = true;
-                    calibrateTimer.current = null;
-                }
-            };
-            tick();
-        }),
-    });
-
-    useEffect(() => {
-        if (animation === "None" || videoElement) return;
+        if (animation === "None" || !actions) return;
         actions[animation]?.play();
         return () => { actions[animation]?.stop(); };
-    }, [actions, animation, videoElement]);
+    }, [actions, animation]);
 
-    const lerpExpression = (name, value, lerpFactor) => {
-        userData.vrm.expressionManager.setValue(
-            name,
-            lerp(userData.vrm.expressionManager.getValue(name), value, lerpFactor)
-        );
+    // Used for Kalidokit Rotations
+    const rotateBone = (boneName, value, slerpFactor, flip = { x: 1, y: 1, z: 1 }) => {
+        const bone = userData.vrm.humanoid.getNormalizedBoneNode(boneName);
+        if (!bone) return;
+        tmpEuler.set(value.x * flip.x, value.y * flip.y, value.z * flip.z);
+        tmpQuat.setFromEuler(tmpEuler);
+        bone.quaternion.slerp(tmpQuat, slerpFactor);
+    };
+
+    // Used for Vector Arms & Fingers
+    const applyDirectFK = (boneName, startLm, endLm, slerpFactor) => {
+        if (!startLm || !endLm) return;
+        const bone = userData.vrm.humanoid.getNormalizedBoneNode(boneName);
+        if (!bone) return;
+
+        let restDir;
+        if (bone.children.length > 0) {
+            restDir = bone.children[0].position.clone().normalize();
+        } else {
+            restDir = bone.position.clone().normalize();
+        }
+        if (restDir.lengthSq() === 0) return;
+
+        const start = new Vector3(startLm.x, -startLm.y, -startLm.z);
+        const end = new Vector3(endLm.x, -endLm.y, -endLm.z);
+        const targetWorldDir = end.sub(start).normalize();
+        if (targetWorldDir.lengthSq() === 0) return;
+
+        const parentWorldQuat = new Quaternion();
+        if (bone.parent) {
+            bone.parent.getWorldQuaternion(parentWorldQuat);
+        }
+        const invParentQuat = parentWorldQuat.invert();
+
+        const targetLocalDir = targetWorldDir.applyQuaternion(invParentQuat);
+        const rotationQuat = new Quaternion().setFromUnitVectors(restDir, targetLocalDir);
+        bone.quaternion.slerp(rotationQuat, slerpFactor);
     };
 
     useFrame((_, delta) => {
-        if (!userData.vrm) return;
-        const vrm = userData.vrm;
+        if (!userData?.vrm) return;
+        userData.vrm.expressionManager.setValue("angry", angry);
+        userData.vrm.expressionManager.setValue("sad", sad);
+        userData.vrm.expressionManager.setValue("happy", happy);
 
-        // 1. ARM IK SOLVER (With Elbow Bend Fix)
-        if (rawPose3D.current && ikSolvers.current.left && ikSolvers.current.right) {
-            const pose3D = rawPose3D.current;
+        // --- FACE & BODY (Kalidokit) ---
+        if (riggedFace.current) {
+            rotateBone("neck", riggedFace.current.head, delta * 5, { x: 0.7, y: 0.7, z: 0.7 });
+        }
+        if (riggedPose.current) {
+            rotateBone("chest", riggedPose.current.Spine, delta * 5, { x: 0.3, y: 0.3, z: 0.3 });
+            rotateBone("spine", riggedPose.current.Spine, delta * 5, { x: 0.3, y: 0.3, z: 0.3 });
+            rotateBone("hips", riggedPose.current.Hips.rotation, delta * 5, { x: 0.7, y: 0.7, z: 0.7 });
+        }
 
-            const updateArmIK = (side, shoulderIdx, wristIdx, upperVrmName, lowerVrmName) => {
-                const mpShoulder = pose3D[shoulderIdx];
-                const mpWrist = pose3D[wristIdx];
+        const raw = rawResults.current;
+        if (raw) {
+            const speed = delta * 12;
 
-                const vrmUpper = vrm.humanoid.getNormalizedBoneNode(upperVrmName);
-                const vrmLower = vrm.humanoid.getNormalizedBoneNode(lowerVrmName);
-                const dummyMesh = dummyMeshes.current[side];
+            // --- ARMS (Direct FK - Stops Crossing) ---
+            if (raw.poseLandmarks) {
+                applyDirectFK("leftUpperArm", raw.poseLandmarks[11], raw.poseLandmarks[13], speed);
+                applyDirectFK("leftLowerArm", raw.poseLandmarks[13], raw.poseLandmarks[15], speed);
 
-                if (!mpShoulder || !mpWrist || !vrmUpper || !vrmLower || !dummyMesh) return;
+                applyDirectFK("rightUpperArm", raw.poseLandmarks[12], raw.poseLandmarks[14], speed);
+                applyDirectFK("rightLowerArm", raw.poseLandmarks[14], raw.poseLandmarks[16], speed);
+            }
 
-                const shoulderWorldPos = new Vector3();
-                vrmUpper.getWorldPosition(shoulderWorldPos);
+            // --- WRISTS (Kalidokit - Fixes Backwards Palm & Roll) ---
+            if (riggedLeftHand.current) {
+                rotateBone("leftHand", {
+                    x: riggedLeftHand.current.LeftWrist.x,
+                    y: riggedLeftHand.current.LeftWrist.y,
+                    z: riggedLeftHand.current.LeftWrist.z
+                }, speed);
+            }
+            if (riggedRightHand.current) {
+                rotateBone("rightHand", {
+                    x: riggedRightHand.current.RightWrist.x,
+                    y: riggedRightHand.current.RightWrist.y,
+                    z: riggedRightHand.current.RightWrist.z
+                }, speed);
+            }
 
-                const armReachScale = 1.5;
-                const dx = -(mpWrist.x - mpShoulder.x) * armReachScale;
-                const dy = -(mpWrist.y - mpShoulder.y) * armReachScale;
-                const dz = (mpWrist.z - mpShoulder.z) * armReachScale;
-
-                // Add a slight forward Z-offset so the elbow always knows which way to bend
-                const elbowBendHint = 0.15;
-
-                ikTargets.current[side].position.set(
-                    shoulderWorldPos.x + dx,
-                    shoulderWorldPos.y + dy,
-                    shoulderWorldPos.z + dz + elbowBendHint
-                );
-
-                dummyMesh.updateMatrixWorld(true);
-                ikSolvers.current[side].update();
-
-                const { shoulder: dShoulder, elbow: dElbow } = dummyBones.current[side];
-
-                vrmUpper.quaternion.slerp(dShoulder.quaternion, delta * 15);
-                vrmLower.quaternion.slerp(dElbow.quaternion, delta * 15);
+            // --- FINGERS (Direct FK - Stops Crumpling) ---
+            const processFingers = (prefix, lh) => {
+                if (!lh) return;
+                applyDirectFK(`${prefix}ThumbProximal`, lh[1], lh[2], speed);
+                applyDirectFK(`${prefix}ThumbMetacarpal`, lh[2], lh[3], speed);
+                applyDirectFK(`${prefix}ThumbDistal`, lh[3], lh[4], speed);
+                applyDirectFK(`${prefix}IndexProximal`, lh[5], lh[6], speed);
+                applyDirectFK(`${prefix}IndexIntermediate`, lh[6], lh[7], speed);
+                applyDirectFK(`${prefix}IndexDistal`, lh[7], lh[8], speed);
+                applyDirectFK(`${prefix}MiddleProximal`, lh[9], lh[10], speed);
+                applyDirectFK(`${prefix}MiddleIntermediate`, lh[10], lh[11], speed);
+                applyDirectFK(`${prefix}MiddleDistal`, lh[11], lh[12], speed);
+                applyDirectFK(`${prefix}RingProximal`, lh[13], lh[14], speed);
+                applyDirectFK(`${prefix}RingIntermediate`, lh[14], lh[15], speed);
+                applyDirectFK(`${prefix}RingDistal`, lh[15], lh[16], speed);
+                applyDirectFK(`${prefix}LittleProximal`, lh[17], lh[18], speed);
+                applyDirectFK(`${prefix}LittleIntermediate`, lh[18], lh[19], speed);
+                applyDirectFK(`${prefix}LittleDistal`, lh[19], lh[20], speed);
             };
 
-            updateArmIK('left', 11, 15, 'leftUpperArm', 'leftLowerArm');
-            updateArmIK('right', 12, 16, 'rightUpperArm', 'rightLowerArm');
+            processFingers("left", raw.leftHandLandmarks);
+            processFingers("right", raw.rightHandLandmarks);
         }
 
-        // 2. HAND PROCESSING (Fixed Space Wrist & Safe Pinch)
-        const processHand = (boneName, lowerArmName, handData) => {
-            if (!handData || !handData.landmarks) return;
-            const { landmarks, isRightHand } = handData;
-
-            const lowerArmBone = vrm.humanoid.getNormalizedBoneNode(lowerArmName);
-            const targetWristQuat = calculateCustomWristRotation(landmarks, isRightHand, lowerArmBone);
-
-            if (targetWristQuat) {
-                const wristBone = vrm.humanoid.getNormalizedBoneNode(boneName);
-                if (wristBone) {
-                    wristBone.quaternion.slerp(targetWristQuat, delta * 15);
-                }
-            }
-
-            const thumbTip = landmarks[4];
-            const indexTip = landmarks[8];
-            const tipDistance = Math.hypot(
-                thumbTip.x - indexTip.x,
-                thumbTip.y - indexTip.y,
-                thumbTip.z - indexTip.z
-            );
-
-            const thumbDistal = vrm.humanoid.getNormalizedBoneNode(isRightHand ? 'rightThumbDistal' : 'leftThumbDistal');
-            const indexDistal = vrm.humanoid.getNormalizedBoneNode(isRightHand ? 'rightIndexDistal' : 'leftIndexDistal');
-
-            if (thumbDistal && indexDistal) {
-                if (tipDistance < 0.05) {
-                    tmpEuler.set(0, 0, isRightHand ? 0.4 : -0.4);
-                    tmpQuat.setFromEuler(tmpEuler);
-                    thumbDistal.quaternion.slerp(tmpQuat, delta * 10);
-
-                    tmpEuler.set(0, 0, isRightHand ? -0.4 : 0.4);
-                    tmpQuat.setFromEuler(tmpEuler);
-                    indexDistal.quaternion.slerp(tmpQuat, delta * 10);
-                }
-            }
-        };
-
-        if (useCustomHandRotation) {
-            processHand('rightHand', 'rightLowerArm', rawRightHandData.current);
-            processHand('leftHand', 'leftLowerArm', rawLeftHandData.current);
-        }
-
-        vrm.update(delta);
+        userData.vrm.update(delta);
     });
 
     const camera = useThree((state) => state.camera);
     const lookAtTarget = useRef();
+
     useEffect(() => {
         lookAtTarget.current = new Object3D();
         camera.add(lookAtTarget.current);
-    }, [camera]);
+    });
 
-    return <primitive object={scene} {...props} />;
-};
+    return (
+        <group {...props}>
+            <primitive object={scene} rotation-y={avatar ? Math.PI : 0} />
+        </group>
+    );
+}; // works ish
