@@ -3,8 +3,9 @@ import { useAnimations, useFBX, useGLTF } from "@react-three/drei";
 import { useFrame, useThree } from "@react-three/fiber";
 import { Face, Hand, Pose } from "kalidokit";
 import { useControls, button } from "leva";
-import {useCallback, useEffect, useMemo, useRef, useState} from "react";
-import { Euler, Matrix4, Object3D, Quaternion, Vector3 } from "three";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Bone, Skeleton, SkinnedMesh, BufferGeometry, Float32BufferAttribute, Vector3, Matrix4, Quaternion, Euler, Object3D } from "three";
+import { CCDIKSolver } from "three/examples/jsm/animation/CCDIKSolver.js";
 import { lerp } from "three/src/math/MathUtils.js";
 import { useVideoRecognition } from "../hooks/useVideoRecognition";
 import { remapMixamoAnimationToVrm } from "../utils/remapMixamoAnimationToVrm";
@@ -14,15 +15,42 @@ const tmpQuat = new Quaternion();
 const tmpEuler = new Euler();
 const tmpMatrix = new Matrix4();
 
+function calculateCustomWristRotation(landmarks, isRightHand, lowerArmBone) {
+    if (!landmarks || landmarks.length < 21 || !lowerArmBone) return null;
 
+    const wrist = new Vector3(landmarks[0].x, -landmarks[0].y, landmarks[0].z);
+    const indexKnuckle = new Vector3(landmarks[5].x, -landmarks[5].y, landmarks[5].z);
+    const pinkyKnuckle = new Vector3(landmarks[17].x, -landmarks[17].y, landmarks[17].z);
 
+    const toIndex = new Vector3().subVectors(indexKnuckle, wrist).normalize();
+    const toPinky = new Vector3().subVectors(pinkyKnuckle, wrist).normalize();
 
+    const palmNormal = new Vector3();
+    if (isRightHand) {
+        palmNormal.crossVectors(toPinky, toIndex).normalize();
+    } else {
+        palmNormal.crossVectors(toIndex, toPinky).normalize();
+    }
 
-// ─────────────────────────────────────────────────────────────
-// PALM-PLANE HAND SOLVER
-// Computes a quaternion from MediaPipe hand landmarks.
-// isRightHand must match what you pass to Kalidokit.Hand.solve()
-// ─────────────────────────────────────────────────────────────
+    const forward = toIndex.clone();
+    const up = palmNormal.clone();
+    const right = new Vector3().crossVectors(forward, up).normalize();
+
+    const rotationMatrix = new Matrix4().makeBasis(right, up, forward);
+    const desiredWorldQuat = new Quaternion().setFromRotationMatrix(rotationMatrix);
+
+    // Convert World Rotation -> Local Bone Rotation space
+    const lowerArmWorldQuat = new Quaternion();
+    lowerArmBone.getWorldQuaternion(lowerArmWorldQuat);
+
+    const localQuat = new Quaternion()
+        .copy(lowerArmWorldQuat)
+        .invert()
+        .multiply(desiredWorldQuat);
+
+    return localQuat;
+}
+
 function solveHandQuaternion(landmarks, isRightHand) {
     if (!landmarks || landmarks.length < 21) return null;
 
@@ -43,19 +71,13 @@ function solveHandQuaternion(landmarks, isRightHand) {
         pinkyMCP.z - wrist.z
     ).normalize();
 
-    // Palm normal: for right hand, cross(pinky, middle); for left, cross(middle, pinky)
     const palmNormal = isRightHand
         ? new Vector3().crossVectors(toPinky, toMiddle).normalize()
         : new Vector3().crossVectors(toMiddle, toPinky).normalize();
 
     const handX = toMiddle.clone();
     const handY = palmNormal.clone().negate();
-
-    // Z = cross(X, Y) naturally points toward thumb for the specified hand type.
-    // NO extra negation needed — the cross product order above already handles it.
     const handZ = new Vector3().crossVectors(handX, handY).normalize();
-
-    // Re-orthonormalize Y so the basis stays perfectly right-handed
     const handY2 = new Vector3().crossVectors(handZ, handX).normalize();
 
     tmpMatrix.makeBasis(handX, handY2, handZ);
@@ -103,27 +125,102 @@ export const VRMAvatar = ({ avatar, ...props }) => {
         currentVrm.scene
     );
 
+    // IK & POSE REFS
+    const ikSolvers = useRef({ left: null, right: null });
+    const ikTargets = useRef({ left: null, right: null });
+    const dummyBones = useRef({ left: {}, right: {} });
+    const dummyMeshes = useRef({ left: null, right: null });
+    const rawPose3D = useRef(null);
+
     const restPoseQuats = useRef({});
     useEffect(() => {
         const vrm = userData.vrm;
-        console.log("VRM loaded:", vrm);
-        VRMUtils.removeUnnecessaryVertices(scene);
-        VRMUtils.combineSkeletons(scene);
-        VRMUtils.combineMorphs(vrm);
+        if (!vrm) return;
+
+        if (!vrm.scene.userData.isOptimized) {
+            try {
+                VRMUtils.removeUnnecessaryVertices(scene);
+                VRMUtils.combineSkeletons(scene);
+                VRMUtils.combineMorphs(vrm);
+            } catch (e) {
+                console.warn("VRM optimization skipped:", e);
+            }
+            vrm.scene.userData.isOptimized = true;
+        }
 
         vrm.scene.traverse((obj) => {
             obj.frustumCulled = false;
         });
 
-        const leftHand = vrm.humanoid.getNormalizedBoneNode("leftHand");
-        const rightHand = vrm.humanoid.getNormalizedBoneNode("rightHand");
-        if (leftHand) restPoseQuats.current.leftHand = leftHand.quaternion.clone();
-        if (rightHand) restPoseQuats.current.rightHand = rightHand.quaternion.clone();
+        const bonesToSave = [
+            "leftUpperArm", "leftLowerArm", "leftHand",
+            "rightUpperArm", "rightLowerArm", "rightHand"
+        ];
+
+        bonesToSave.forEach(boneName => {
+            const bone = vrm.humanoid.getNormalizedBoneNode(boneName);
+            if (bone) restPoseQuats.current[boneName] = bone.quaternion.clone();
+        });
+
+        const setupArmIK = (side, upperName, lowerName, handName) => {
+            const vrmUpper = vrm.humanoid.getNormalizedBoneNode(upperName);
+            const vrmLower = vrm.humanoid.getNormalizedBoneNode(lowerName);
+            const vrmHand = vrm.humanoid.getNormalizedBoneNode(handName);
+            if (!vrmUpper || !vrmLower || !vrmHand) return;
+
+            const dShoulder = new Bone();
+            const dElbow = new Bone();
+            const dWrist = new Bone();
+            const dTarget = new Bone();
+
+            dShoulder.position.copy(vrmUpper.position);
+            dElbow.position.copy(vrmLower.position);
+            dWrist.position.copy(vrmHand.position);
+
+            dShoulder.add(dElbow);
+            dElbow.add(dWrist);
+
+            const geo = new BufferGeometry();
+            geo.setAttribute('position', new Float32BufferAttribute([0, 0, 0], 3));
+            // Add blank skin weights and indices so Three.js SkinnedMesh doesn't crash
+            geo.setAttribute('skinIndex', new Float32BufferAttribute([0, 0, 0, 0], 4));
+            geo.setAttribute('skinWeight', new Float32BufferAttribute([1, 0, 0, 0], 4));
+
+            const dummyMesh = new SkinnedMesh(geo, undefined);
+            dummyMesh.frustumCulled = false; // Prevent projection bounding sphere crashes
+            dummyMesh.add(dShoulder);
+            dummyMesh.add(dTarget);
+
+            vrm.scene.add(dummyMesh);
+            dummyMeshes.current[side] = dummyMesh;
+
+            const skeleton = new Skeleton([dShoulder, dElbow, dWrist, dTarget]);
+            dummyMesh.bind(skeleton);
+
+            const iks = [{
+                target: 3,
+                effector: 2,
+                links: [{ index: 1 }, { index: 0 }],
+                iteration: 5
+            }];
+
+            const solver = new CCDIKSolver(dummyMesh, iks);
+
+            ikSolvers.current[side] = solver;
+            ikTargets.current[side] = dTarget;
+            dummyBones.current[side] = { shoulder: dShoulder, elbow: dElbow };
+        };
+
+        setupArmIK('left', 'leftUpperArm', 'leftLowerArm', 'leftHand');
+        setupArmIK('right', 'rightUpperArm', 'rightLowerArm', 'rightHand');
+
+        return () => {
+            if (dummyMeshes.current.left) dummyMeshes.current.left.removeFromParent();
+            if (dummyMeshes.current.right) dummyMeshes.current.right.removeFromParent();
+        };
     }, [scene, userData.vrm]);
 
-    const setResultsCallback = useVideoRecognition(
-        (state) => state.setResultsCallback
-    );
+    const setResultsCallback = useVideoRecognition((state) => state.setResultsCallback);
     const videoElement = useVideoRecognition((state) => state.videoElement);
     const riggedFace = useRef();
     const riggedPose = useRef();
@@ -139,6 +236,11 @@ export const VRMAvatar = ({ avatar, ...props }) => {
     const resultsCallback = useCallback(
         (results) => {
             if (!videoElement || !currentVrm) return;
+
+            // Fallback safely to poseLandmarks if poseWorldLandmarks is missing
+            if (results.poseWorldLandmarks || results.poseLandmarks) {
+                rawPose3D.current = results.poseWorldLandmarks || results.poseLandmarks;
+            }
 
             if (results.faceLandmarks) {
                 riggedFace.current = Face.solve(results.faceLandmarks, {
@@ -157,7 +259,6 @@ export const VRMAvatar = ({ avatar, ...props }) => {
                 });
             }
 
-            // Mirror effect: MP left → VRM right, MP right → VRM left
             if (results.leftHandLandmarks) {
                 rawRightHandData.current = {
                     landmarks: results.leftHandLandmarks,
@@ -180,23 +281,13 @@ export const VRMAvatar = ({ avatar, ...props }) => {
         setResultsCallback(resultsCallback);
     }, [resultsCallback]);
 
-
-
     const calibrateTimer = useRef(null);
     const [calibCountdown, setCalibCountdown] = useState(null);
 
-
     const {
-        aa,
-        ih,
-        ee,
-        oh,
-        ou,
-        blinkLeft,
-        blinkRight,
-        angry,
-        sad,
-        happy,
+        aa, ih, ee, oh, ou,
+        blinkLeft, blinkRight,
+        angry, sad, happy,
         animation,
         useCustomHandRotation,
     } = useControls("VRM", {
@@ -220,7 +311,6 @@ export const VRMAvatar = ({ avatar, ...props }) => {
             let seconds = 5;
             setCalibCountdown(seconds);
             const tick = () => {
-                console.log(`Calibrating in ${seconds}...`);
                 seconds--;
                 setCalibCountdown(seconds >= 0 ? seconds : null);
                 if (seconds >= 0) {
@@ -232,17 +322,12 @@ export const VRMAvatar = ({ avatar, ...props }) => {
             };
             tick();
         }),
-
     });
 
     useEffect(() => {
-        if (animation === "None" || videoElement) {
-            return;
-        }
+        if (animation === "None" || videoElement) return;
         actions[animation]?.play();
-        return () => {
-            actions[animation]?.stop();
-        };
+        return () => { actions[animation]?.stop(); };
     }, [actions, animation, videoElement]);
 
     const lerpExpression = (name, value, lerpFactor) => {
@@ -252,228 +337,101 @@ export const VRMAvatar = ({ avatar, ...props }) => {
         );
     };
 
-    const rotateBone = (
-        boneName,
-        value,
-        slerpFactor,
-        flip = { x: 1, y: 1, z: 1 }
-    ) => {
-        const bone = userData.vrm.humanoid.getNormalizedBoneNode(boneName);
-        if (!bone) {
-            console.warn(
-                `Bone ${boneName} not found in VRM humanoid. Check the bone name.`
-            );
-            console.log("userData.vrm.humanoid.bones", userData.vrm.humanoid);
-            return;
-        }
-
-        tmpEuler.set(value.x * flip.x, value.y * flip.y, value.z * flip.z);
-        tmpQuat.setFromEuler(tmpEuler);
-        bone.quaternion.slerp(tmpQuat, slerpFactor);
-    };
-
-    const applyCustomHand = (boneName, handData, slerpFactor) => {
-        if (!handData) return;
-        const { landmarks, isRightHand } = handData;
-
-        const bone = userData.vrm.humanoid.getNormalizedBoneNode(boneName);
-        const lowerArmName =
-            boneName === "leftHand" ? "leftLowerArm" : "rightLowerArm";
-        const lowerArm = userData.vrm.humanoid.getNormalizedBoneNode(lowerArmName);
-        if (!bone || !lowerArm) return;
-
-        const mpQuat = solveHandQuaternion(landmarks, isRightHand);
-        if (!mpQuat) return;
-
-        if (calibrateFlag.current) {
-            if (restPoseQuats.current[boneName]) {
-                bone.quaternion.copy(restPoseQuats.current[boneName]);
-            }
-
-            const lowerArmWorld = new Quaternion();
-            lowerArm.getWorldQuaternion(lowerArmWorld);
-
-            const offsetWorld = new Quaternion()
-                .multiplyQuaternions(lowerArmWorld, bone.quaternion)
-                .multiply(mpQuat.clone().invert());
-
-            handCalibData.current[boneName] = { offsetWorld };
-        }
-
-        const calib = handCalibData.current[boneName];
-        if (!calib) return;
-
-        const currentLowerArmWorld = new Quaternion();
-        lowerArm.getWorldQuaternion(currentLowerArmWorld);
-
-        const desiredHandWorld = new Quaternion().multiplyQuaternions(
-            calib.offsetWorld,
-            mpQuat
-        );
-
-        const handLocal = new Quaternion().multiplyQuaternions(
-            currentLowerArmWorld.clone().invert(),
-            desiredHandWorld
-        );
-
-        // Shortest-path slerp fix: if dot product is negative, flip the sign
-        if (bone.quaternion.dot(handLocal) < 0) {
-            handLocal.set(
-                -handLocal.x,
-                -handLocal.y,
-                -handLocal.z,
-                -handLocal.w
-            );
-        }
-
-        bone.quaternion.slerp(handLocal, slerpFactor);
-    };
-
     useFrame((_, delta) => {
         if (!userData.vrm) return;
-        userData.vrm.expressionManager.setValue("angry", angry);
-        userData.vrm.expressionManager.setValue("sad", sad);
-        userData.vrm.expressionManager.setValue("happy", happy);
+        const vrm = userData.vrm;
 
-        if (!videoElement) {
-            [
-                { name: "aa", value: aa },
-                { name: "ih", value: ih },
-                { name: "ee", value: ee },
-                { name: "oh", value: oh },
-                { name: "ou", value: ou },
-                { name: "blinkLeft", value: blinkLeft },
-                { name: "blinkRight", value: blinkRight },
-            ].forEach((item) => {
-                lerpExpression(item.name, item.value, delta * 12);
-            });
-        } else {
-            if (riggedFace.current) {
-                [
-                    { name: "aa", value: riggedFace.current.mouth.shape.A },
-                    { name: "ih", value: riggedFace.current.mouth.shape.I },
-                    { name: "ee", value: riggedFace.current.mouth.shape.E },
-                    { name: "oh", value: riggedFace.current.mouth.shape.O },
-                    { name: "ou", value: riggedFace.current.mouth.shape.U },
-                    { name: "blinkLeft", value: 1 - riggedFace.current.eye.l },
-                    { name: "blinkRight", value: 1 - riggedFace.current.eye.r },
-                ].forEach((item) => {
-                    lerpExpression(item.name, item.value, delta * 12);
-                });
+        // 1. ARM IK SOLVER (With Elbow Bend Fix)
+        if (rawPose3D.current && ikSolvers.current.left && ikSolvers.current.right) {
+            const pose3D = rawPose3D.current;
 
-                if (lookAtTarget.current) {
-                    userData.vrm.lookAt.target = lookAtTarget.current;
-                    lookAtDestination.current.set(
-                        -2 * riggedFace.current.pupil.x,
-                        2 * riggedFace.current.pupil.y,
-                        0
-                    );
-                    lookAtTarget.current.position.lerp(
-                        lookAtDestination.current,
-                        delta * 5
-                    );
-                }
+            const updateArmIK = (side, shoulderIdx, wristIdx, upperVrmName, lowerVrmName) => {
+                const mpShoulder = pose3D[shoulderIdx];
+                const mpWrist = pose3D[wristIdx];
 
-                rotateBone("neck", riggedFace.current.head, delta * 5, {
-                    x: 0.7,
-                    y: 0.7,
-                    z: 0.7,
-                });
-            }
+                const vrmUpper = vrm.humanoid.getNormalizedBoneNode(upperVrmName);
+                const vrmLower = vrm.humanoid.getNormalizedBoneNode(lowerVrmName);
+                const dummyMesh = dummyMeshes.current[side];
 
-            if (riggedPose.current) {
-                rotateBone("chest", riggedPose.current.Spine, delta * 5, {
-                    x: 0.3,
-                    y: 0.3,
-                    z: 0.3,
-                });
-                rotateBone("spine", riggedPose.current.Spine, delta * 5, {
-                    x: 0.3,
-                    y: 0.3,
-                    z: 0.3,
-                });
-                rotateBone("hips", riggedPose.current.Hips.rotation, delta * 5, {
-                    x: 0.7,
-                    y: 0.7,
-                    z: 0.7,
-                });
+                if (!mpShoulder || !mpWrist || !vrmUpper || !vrmLower || !dummyMesh) return;
 
-                rotateBone("leftUpperArm", riggedPose.current.LeftUpperArm, delta * 5);
-                rotateBone("leftLowerArm", riggedPose.current.LeftLowerArm, delta * 5);
-                rotateBone("rightUpperArm", riggedPose.current.RightUpperArm, delta * 5);
-                rotateBone("rightLowerArm", riggedPose.current.RightLowerArm, delta * 5);
+                const shoulderWorldPos = new Vector3();
+                vrmUpper.getWorldPosition(shoulderWorldPos);
 
-                if (useCustomHandRotation) {
-                    applyCustomHand("leftHand", rawLeftHandData.current, delta * 12);
-                    applyCustomHand("rightHand", rawRightHandData.current, delta * 12);
-                } else {
-                    if (riggedLeftHand.current) {
-                        rotateBone(
-                            "leftHand",
-                            {
-                                z: riggedPose.current.LeftHand.z,
-                                y: riggedLeftHand.current.LeftWrist.y,
-                                x: riggedLeftHand.current.LeftWrist.x,
-                            },
-                            delta * 12
-                        );
-                    }
-                    if (riggedRightHand.current) {
-                        rotateBone(
-                            "rightHand",
-                            {
-                                z: riggedPose.current.RightHand.z,
-                                y: riggedRightHand.current.RightWrist.y,
-                                x: riggedRightHand.current.RightWrist.x,
-                            },
-                            delta * 12
-                        );
-                    }
-                }
+                const armReachScale = 1.5;
+                const dx = -(mpWrist.x - mpShoulder.x) * armReachScale;
+                const dy = -(mpWrist.y - mpShoulder.y) * armReachScale;
+                const dz = (mpWrist.z - mpShoulder.z) * armReachScale;
 
-                if (riggedLeftHand.current) {
-                    rotateBone("leftRingProximal", riggedLeftHand.current.LeftRingProximal, delta * 12);
-                    rotateBone("leftRingIntermediate", riggedLeftHand.current.LeftRingIntermediate, delta * 12);
-                    rotateBone("leftRingDistal", riggedLeftHand.current.LeftRingDistal, delta * 12);
-                    rotateBone("leftIndexProximal", riggedLeftHand.current.LeftIndexProximal, delta * 12);
-                    rotateBone("leftIndexIntermediate", riggedLeftHand.current.LeftIndexIntermediate, delta * 12);
-                    rotateBone("leftIndexDistal", riggedLeftHand.current.LeftIndexDistal, delta * 12);
-                    rotateBone("leftMiddleProximal", riggedLeftHand.current.LeftMiddleProximal, delta * 12);
-                    rotateBone("leftMiddleIntermediate", riggedLeftHand.current.LeftMiddleIntermediate, delta * 12);
-                    rotateBone("leftMiddleDistal", riggedLeftHand.current.LeftMiddleDistal, delta * 12);
-                    rotateBone("leftThumbProximal", riggedLeftHand.current.LeftThumbProximal, delta * 12);
-                    rotateBone("leftThumbMetacarpal", riggedLeftHand.current.LeftThumbIntermediate, delta * 12);
-                    rotateBone("leftThumbDistal", riggedLeftHand.current.LeftThumbDistal, delta * 12);
-                    rotateBone("leftLittleProximal", riggedLeftHand.current.LeftLittleProximal, delta * 12);
-                    rotateBone("leftLittleIntermediate", riggedLeftHand.current.LeftLittleIntermediate, delta * 12);
-                    rotateBone("leftLittleDistal", riggedLeftHand.current.LeftLittleDistal, delta * 12);
-                }
+                // Add a slight forward Z-offset so the elbow always knows which way to bend
+                const elbowBendHint = 0.15;
 
-                if (riggedRightHand.current) {
-                    rotateBone("rightRingProximal", riggedRightHand.current.RightRingProximal, delta * 12);
-                    rotateBone("rightRingIntermediate", riggedRightHand.current.RightRingIntermediate, delta * 12);
-                    rotateBone("rightRingDistal", riggedRightHand.current.RightRingDistal, delta * 12);
-                    rotateBone("rightIndexProximal", riggedRightHand.current.RightIndexProximal, delta * 12);
-                    rotateBone("rightIndexIntermediate", riggedRightHand.current.RightIndexIntermediate, delta * 12);
-                    rotateBone("rightIndexDistal", riggedRightHand.current.RightIndexDistal, delta * 12);
-                    rotateBone("rightMiddleProximal", riggedRightHand.current.RightMiddleProximal, delta * 12);
-                    rotateBone("rightMiddleIntermediate", riggedRightHand.current.RightMiddleIntermediate, delta * 12);
-                    rotateBone("rightMiddleDistal", riggedRightHand.current.RightMiddleDistal, delta * 12);
-                    rotateBone("rightThumbProximal", riggedRightHand.current.RightThumbProximal, delta * 12);
-                    rotateBone("rightThumbMetacarpal", riggedRightHand.current.RightThumbIntermediate, delta * 12);
-                    rotateBone("rightThumbDistal", riggedRightHand.current.RightThumbDistal, delta * 12);
-                    rotateBone("rightLittleProximal", riggedRightHand.current.RightLittleProximal, delta * 12);
-                    rotateBone("rightLittleIntermediate", riggedRightHand.current.RightLittleIntermediate, delta * 12);
-                    rotateBone("rightLittleDistal", riggedRightHand.current.RightLittleDistal, delta * 12);
-                }
-            }
+                ikTargets.current[side].position.set(
+                    shoulderWorldPos.x + dx,
+                    shoulderWorldPos.y + dy,
+                    shoulderWorldPos.z + dz + elbowBendHint
+                );
+
+                dummyMesh.updateMatrixWorld(true);
+                ikSolvers.current[side].update();
+
+                const { shoulder: dShoulder, elbow: dElbow } = dummyBones.current[side];
+
+                vrmUpper.quaternion.slerp(dShoulder.quaternion, delta * 15);
+                vrmLower.quaternion.slerp(dElbow.quaternion, delta * 15);
+            };
+
+            updateArmIK('left', 11, 15, 'leftUpperArm', 'leftLowerArm');
+            updateArmIK('right', 12, 16, 'rightUpperArm', 'rightLowerArm');
         }
 
-        if (calibrateFlag.current) calibrateFlag.current = false;
-        userData.vrm.update(delta);
+        // 2. HAND PROCESSING (Fixed Space Wrist & Safe Pinch)
+        const processHand = (boneName, lowerArmName, handData) => {
+            if (!handData || !handData.landmarks) return;
+            const { landmarks, isRightHand } = handData;
+
+            const lowerArmBone = vrm.humanoid.getNormalizedBoneNode(lowerArmName);
+            const targetWristQuat = calculateCustomWristRotation(landmarks, isRightHand, lowerArmBone);
+
+            if (targetWristQuat) {
+                const wristBone = vrm.humanoid.getNormalizedBoneNode(boneName);
+                if (wristBone) {
+                    wristBone.quaternion.slerp(targetWristQuat, delta * 15);
+                }
+            }
+
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const tipDistance = Math.hypot(
+                thumbTip.x - indexTip.x,
+                thumbTip.y - indexTip.y,
+                thumbTip.z - indexTip.z
+            );
+
+            const thumbDistal = vrm.humanoid.getNormalizedBoneNode(isRightHand ? 'rightThumbDistal' : 'leftThumbDistal');
+            const indexDistal = vrm.humanoid.getNormalizedBoneNode(isRightHand ? 'rightIndexDistal' : 'leftIndexDistal');
+
+            if (thumbDistal && indexDistal) {
+                if (tipDistance < 0.05) {
+                    tmpEuler.set(0, 0, isRightHand ? 0.4 : -0.4);
+                    tmpQuat.setFromEuler(tmpEuler);
+                    thumbDistal.quaternion.slerp(tmpQuat, delta * 10);
+
+                    tmpEuler.set(0, 0, isRightHand ? -0.4 : 0.4);
+                    tmpQuat.setFromEuler(tmpEuler);
+                    indexDistal.quaternion.slerp(tmpQuat, delta * 10);
+                }
+            }
+        };
+
+        if (useCustomHandRotation) {
+            processHand('rightHand', 'rightLowerArm', rawRightHandData.current);
+            processHand('leftHand', 'leftLowerArm', rawLeftHandData.current);
+        }
+
+        vrm.update(delta);
     });
 
-    const lookAtDestination = useRef(new Vector3(0, 0, 0));
     const camera = useThree((state) => state.camera);
     const lookAtTarget = useRef();
     useEffect(() => {
