@@ -2,7 +2,7 @@ import { CameraControls, Environment, Gltf } from "@react-three/drei";
 import { Bloom, EffectComposer } from "@react-three/postprocessing";
 import { useRef } from "react";
 import {useControls} from "leva";
-import {VRMavatar} from "./vrmAvatar.jsx";
+import {VRMAvatar} from "./vrmAvatar.jsx";
 
 export const Experience = () => {
   const controls = useRef();
@@ -30,13 +30,7 @@ export const Experience = () => {
       <directionalLight intensity={2} position={[10, 10, 5]} />
       <directionalLight intensity={1} position={[-10, 10, 5]} />
       <group position-y={-1.25}>
-        <VRMavatar avatar={avatar} />
-        <Gltf
-          src="models/sound-stage-final.glb"
-          position-z={-1.4}
-          position-x={-0.5}
-          scale={0.65}
-        />
+        <VRMAvatar avatar={avatar} />
       </group>
       <EffectComposer>
         <Bloom mipmapBlur intensity={0.7} />
