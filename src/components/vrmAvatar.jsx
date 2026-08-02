@@ -91,7 +91,7 @@ export const VRMavatar = ({ avatar, ...props }) => {
 
     // Standard directional FK — rotates bone to point startLm → endLm.
     // Used for fingers where the bone chain follows the landmark chain exactly.
-    const applyDirectFK = (boneName, startLm, endLm, slerpFactor) => {
+    const applyDirectFK = (boneName, startLm, endLm, slerpFactor, maxAngle = Infinity) => {
         if (!startLm || !endLm) return;
         const bone = userData.vrm?.humanoid.getNormalizedBoneNode(boneName);
         if (!bone) return;
@@ -114,10 +114,20 @@ export const VRMavatar = ({ avatar, ...props }) => {
         const targetLocalDir = targetWorldDir.clone()
             .applyQuaternion(parentWorldQuat.clone().invert());
 
-        bone.quaternion.slerp(
-            new Quaternion().setFromUnitVectors(restDir, targetLocalDir),
-            slerpFactor
-        );
+        const rotationQuat = new Quaternion().setFromUnitVectors(restDir, targetLocalDir);
+
+        // --- ANTI-COLLAPSE SAFEGUARD ---
+        if (maxAngle !== Infinity) {
+            const identityQ = new Quaternion();
+            const currentAngle = rotationQuat.angleTo(identityQ);
+            // If the joint tries to bend further than anatomically possible, scale it back
+            if (currentAngle > maxAngle) {
+                rotationQuat.slerpQuaternions(identityQ, rotationQuat, maxAngle / currentAngle);
+            }
+        }
+        // -------------------------------
+
+        bone.quaternion.slerp(rotationQuat, slerpFactor);
     };
 
     // Arm FK with shoulder-relative direction.
@@ -271,21 +281,29 @@ export const VRMavatar = ({ avatar, ...props }) => {
 
         const applyFingers = (prefix, lms) => {
             if (!lms) return;
-            applyDirectFK(`${prefix}ThumbProximal`,      lms[1],  lms[2],  speed);
-            applyDirectFK(`${prefix}ThumbMetacarpal`,    lms[2],  lms[3],  speed);
-            applyDirectFK(`${prefix}ThumbDistal`,        lms[3],  lms[4],  speed);
-            applyDirectFK(`${prefix}IndexProximal`,      lms[5],  lms[6],  speed);
-            applyDirectFK(`${prefix}IndexIntermediate`,  lms[6],  lms[7],  speed);
-            applyDirectFK(`${prefix}IndexDistal`,        lms[7],  lms[8],  speed);
-            applyDirectFK(`${prefix}MiddleProximal`,     lms[9],  lms[10], speed);
-            applyDirectFK(`${prefix}MiddleIntermediate`, lms[10], lms[11], speed);
-            applyDirectFK(`${prefix}MiddleDistal`,       lms[11], lms[12], speed);
-            applyDirectFK(`${prefix}RingProximal`,       lms[13], lms[14], speed);
-            applyDirectFK(`${prefix}RingIntermediate`,   lms[14], lms[15], speed);
-            applyDirectFK(`${prefix}RingDistal`,         lms[15], lms[16], speed);
-            applyDirectFK(`${prefix}LittleProximal`,     lms[17], lms[18], speed);
-            applyDirectFK(`${prefix}LittleIntermediate`, lms[18], lms[19], speed);
-            applyDirectFK(`${prefix}LittleDistal`,       lms[19], lms[20], speed);
+
+            // depending on how tight you want the fist to be able to clench.
+            const maxBend = 3;
+
+            applyDirectFK(`${prefix}ThumbMetacarpal`,      lms[1],  lms[2],  speed, maxBend);
+            applyDirectFK(`${prefix}ThumbProximal`,    lms[2],  lms[3],  speed, maxBend);
+            applyDirectFK(`${prefix}ThumbDistal`,        lms[3],  lms[4],  speed, maxBend);
+
+            applyDirectFK(`${prefix}IndexProximal`,      lms[5],  lms[6],  speed, maxBend);
+            applyDirectFK(`${prefix}IndexIntermediate`,  lms[6],  lms[7],  speed, maxBend);
+            applyDirectFK(`${prefix}IndexDistal`,        lms[7],  lms[8],  speed, maxBend);
+
+            applyDirectFK(`${prefix}MiddleProximal`,     lms[9],  lms[10], speed, maxBend);
+            applyDirectFK(`${prefix}MiddleIntermediate`, lms[10], lms[11], speed, maxBend);
+            applyDirectFK(`${prefix}MiddleDistal`,       lms[11], lms[12], speed, maxBend);
+
+            applyDirectFK(`${prefix}RingProximal`,       lms[13], lms[14], speed, maxBend);
+            applyDirectFK(`${prefix}RingIntermediate`,   lms[14], lms[15], speed, maxBend);
+            applyDirectFK(`${prefix}RingDistal`,         lms[15], lms[16], speed, maxBend);
+
+            applyDirectFK(`${prefix}LittleProximal`,     lms[17], lms[18], speed, maxBend);
+            applyDirectFK(`${prefix}LittleIntermediate`, lms[18], lms[19], speed, maxBend);
+            applyDirectFK(`${prefix}LittleDistal`,       lms[19], lms[20], speed, maxBend);
         };
 
         applyFingers("left",  raw.leftHandLandmarks);
