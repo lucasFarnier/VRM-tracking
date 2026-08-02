@@ -253,7 +253,26 @@ export const VRMavatar = ({ avatar, ...props }) => {
         const speed = delta * 12;
 
         if (riggedFace.current) {
-            rotateBone("neck", riggedFace.current.head, delta * 5, { x: 0.7, y: 0.7, z: 0.7 });
+            const face = riggedFace.current;
+
+            // 1. Head & Neck Rotation
+            // Note: Because your avatar is flipped 180 degrees, if your head turns
+            // backwards like the hands did, simply change y and z to -0.7
+            rotateBone("neck", face.head, delta * 5, { x: 0.7, y: 0.7, z: 0.7 });
+            rotateBone("head", face.head, delta * 5, { x: 0.7, y: 0.7, z: 0.7 });
+
+            // 2. Eyes (Blinking)
+            // Kalidokit outputs 1 for wide open and 0 for closed.
+            // VRM expects the exact opposite (0 for open, 1 for fully blinked).
+            vrm.expressionManager.setValue("blinkLeft", Math.max(0, 1 - face.eye.l));
+            vrm.expressionManager.setValue("blinkRight", Math.max(0, 1 - face.eye.r));
+
+            // 3. Mouth (Vowels)
+            vrm.expressionManager.setValue("aa", face.mouth.shape.A);
+            vrm.expressionManager.setValue("ee", face.mouth.shape.E);
+            vrm.expressionManager.setValue("ih", face.mouth.shape.I);
+            vrm.expressionManager.setValue("oh", face.mouth.shape.O);
+            vrm.expressionManager.setValue("ou", face.mouth.shape.U);
         }
         if (riggedPose.current) {
             rotateBone("chest", riggedPose.current.Spine, delta * 5, { x: 0.3, y: 0.3, z: 0.3 });
