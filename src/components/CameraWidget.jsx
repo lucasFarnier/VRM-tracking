@@ -1,83 +1,34 @@
 import { Camera } from "@mediapipe/camera_utils";
-
-import { drawConnectors, drawLandmarks } from "@mediapipe/drawing_utils";
-import {
-    FACEMESH_TESSELATION,
-    HAND_CONNECTIONS,
-    Holistic,
-    POSE_CONNECTIONS,
-} from "@mediapipe/holistic";
+import { Holistic } from "@mediapipe/holistic";
 import { useEffect, useRef, useState } from "react";
 import { useVideoRecognition } from "../hooks/useVideoRecognition";
 
+// --- MOBILE DETECTION (computed once at module load) ---
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
 export const CameraWidget = () => {
-    const [start, setStart] = useState(false);
+    // `visible` now only controls whether the preview UI is shown/hidden.
+    // It no longer starts/stops the camera or Mediapipe pipeline — those
+    // run continuously from mount to unmount.
+    const [visible, setVisible] = useState(false);
     const videoElement = useRef();
-    const drawCanvas = useRef();
     const setVideoElement = useVideoRecognition((state) => state.setVideoElement);
 
-    const drawResults = (results) => {
-        drawCanvas.current.width = videoElement.current.videoWidth;
-        drawCanvas.current.height = videoElement.current.videoHeight;
-        let canvasCtx = drawCanvas.current.getContext("2d");
-        canvasCtx.save();
-        canvasCtx.clearRect(
-            0,
-            0,
-            drawCanvas.current.width,
-            drawCanvas.current.height
-        );
-        // Use `Mediapipe` drawing functions
-        drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, {
-            color: "#00cff7",
-            lineWidth: 4,
-        });
-        drawLandmarks(canvasCtx, results.poseLandmarks, {
-            color: "#ff0364",
-            lineWidth: 2,
-        });
-        drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_TESSELATION, {
-            color: "#C0C0C070",
-            lineWidth: 1,
-        });
-        if (results.faceLandmarks && results.faceLandmarks.length === 478) {
-            //draw pupils
-            drawLandmarks(
-                canvasCtx,
-                [results.faceLandmarks[468], results.faceLandmarks[468 + 5]],
-                {
-                    color: "#ffe603",
-                    lineWidth: 2,
-                }
-            );
-        }
-        drawConnectors(canvasCtx, results.leftHandLandmarks, HAND_CONNECTIONS, {
-            color: "#eb1064",
-            lineWidth: 5,
-        });
-        drawLandmarks(canvasCtx, results.leftHandLandmarks, {
-            color: "#00cff7",
-            lineWidth: 2,
-        });
-        drawConnectors(canvasCtx, results.rightHandLandmarks, HAND_CONNECTIONS, {
-            color: "#22c3e3",
-            lineWidth: 5,
-        });
-        drawLandmarks(canvasCtx, results.rightHandLandmarks, {
-            color: "#ff0364",
-            lineWidth: 2,
-        });
-    };
+    // Used to skip frames on mobile (every 3rd frame is sent to Mediapipe)
+    const frameCount = useRef(0);
 
+    const holisticRef = useRef(null);
+    const cameraRef = useRef(null);
+
+    // Camera + Holistic are set up once and run for the lifetime of the
+    // component — webcam stays active and tracking keeps running whether
+    // or not the preview is shown. Only torn down on unmount.
     useEffect(() => {
-        if (!start) {
-            setVideoElement(null);
-            return;
-        }
         if (useVideoRecognition.getState().videoElement) {
             return;
         }
         setVideoElement(videoElement.current);
+
         const holistic = new Holistic({
             locateFile: (file) => {
                 return `https://cdn.jsdelivr.net/npm/@mediapipe/holistic@0.5.1635989137/${file}`;
@@ -88,33 +39,45 @@ export const CameraWidget = () => {
             smoothLandmarks: false,
             minDetectionConfidence: 0.65,
             minTrackingConfidence: 0.65,
-            refineFaceLandmarks: true,
+            refineFaceLandmarks: !isMobile,
         });
         holistic.onResults((results) => {
-            drawResults(results);
             useVideoRecognition.getState().resultsCallback?.(results);
         });
+        holisticRef.current = holistic;
+
         const camera = new Camera(videoElement.current, {
             onFrame: async () => {
+                frameCount.current++;
+                if (isMobile && frameCount.current % 3 !== 0) return;
                 await holistic.send({ image: videoElement.current });
             },
-            width: 640,
-            height: 480,
+            width: isMobile ? 320 : 640,
+            height: isMobile ? 240 : 480,
         });
+        cameraRef.current = camera;
         camera.start();
-    }, [start]);
+
+        return () => {
+            cameraRef.current?.stop();
+            cameraRef.current = null;
+            holisticRef.current?.close();
+            holisticRef.current = null;
+            setVideoElement(null);
+        };
+    }, []);
 
     return (
         <>
             <button
-                onClick={() => setStart((prev) => !prev)}
+                onClick={() => setVisible((prev) => !prev)}
                 className={`fixed bottom-4 right-4 cursor-pointer ${
-                    start
+                    visible
                         ? "bg-red-500 hover:bg-red-700"
                         : "bg-indigo-400 hover:bg-indigo-700"
                 } transition-colors duration-200 flex items-center justify-center z-20 p-4 rounded-full text-white drop-shadow-sm`}
             >
-                {!start ? (
+                {!visible ? (
                     <svg
                         xmlns="http://www.w3.org/2000/svg"
                         fill="none"
@@ -148,15 +111,11 @@ export const CameraWidget = () => {
             </button>
             <div
                 className={`absolute z-[999999] bottom-24 right-4 w-[320px] h-[240px] rounded-[20px] overflow-hidden ${
-                    !start ? "hidden" : ""
+                    !visible ? "hidden" : ""
                 }`}
                 width={640}
                 height={480}
             >
-                <canvas
-                    ref={drawCanvas}
-                    className="absolute z-10 w-full h-full bg-black/50 top-0 left-0"
-                />
                 <video
                     ref={videoElement}
                     className="absolute z-0 w-full h-full top-0 left-0"

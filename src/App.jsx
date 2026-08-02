@@ -4,6 +4,8 @@ import { Suspense } from "react";
 import { Experience } from "./components/Experience";
 import { CameraWidget } from "./components/CameraWidget.jsx";
 
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
 function App() {
     return (
         <>
@@ -15,10 +17,10 @@ function App() {
               you cannot see jagged edges anyway, so doing this saves a massive amount of processing power.
             */}
             <Canvas
-                shadows
+                shadows={!isMobile} // Turn off shadows completely on phones
                 camera={{ position: [0.25, 0.25, 2], fov: 30 }}
-                dpr={[1, 1.5]}
-                gl={{ antialias: false }}
+                dpr={isMobile ? 1 : [1, 1.5]} // Force 1x pixel density on phones
+                gl={{ antialias: false, powerPreference: "high-performance" }}
             >
                 <color attach="background" args={["#333"]} />
                 <fog attach="fog" args={["#333", 10, 20]} />
