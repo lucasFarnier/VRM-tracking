@@ -84,7 +84,7 @@ export const CameraWidget = () => {
             },
         });
         holistic.setOptions({
-            modelComplexity: 1,
+            modelComplexity: 0,
             smoothLandmarks: true,
             minDetectionConfidence: 0.7,
             minTrackingConfidence: 0.7,
