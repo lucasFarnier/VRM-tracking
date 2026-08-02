@@ -8,7 +8,8 @@ import { Euler, Matrix4, Object3D, Quaternion, Vector3 } from "three";
 import { useVideoRecognition } from "../hooks/useVideoRecognition";
 import { remapMixamoAnimationToVrm } from "../utils/remapMixamoAnimationToVrm";
 
-// --- GLOBAL TEMPORARY VARIABLES ---
+// --- MEMORY OPTIMIZATION: GLOBAL TEMPORARY VARIABLES ---
+// We reuse these every frame to prevent Garbage Collection lag.
 const tmpEuler = new Euler();
 const tmpMat   = new Matrix4();
 const tmpV1 = new Vector3();
@@ -17,8 +18,9 @@ const tmpV3 = new Vector3();
 const tmpV4 = new Vector3();
 const tmpQ1 = new Quaternion();
 const tmpQ2 = new Quaternion();
-const identityQ = new Quaternion();
+const identityQ = new Quaternion(); // Always stays 0,0,0,1
 
+// Re-uses a target Vector3 instead of creating a new one
 const applyMpToThree = (l, target) => target.set(l.x, -l.y, -l.z);
 
 export const VRMavatar = ({ avatar, ...props }) => {
@@ -53,9 +55,6 @@ export const VRMavatar = ({ avatar, ...props }) => {
     const riggedFace = useRef();
     const riggedPose = useRef();
 
-    // Ref to track which frame we are on for Time-Slicing
-    const frameCount = useRef(0);
-
     const resultsCallback = useCallback((results) => {
         if (!videoElement || !currentVrm) return;
         rawResults.current = results;
@@ -88,6 +87,7 @@ export const VRMavatar = ({ avatar, ...props }) => {
         return () => { actions[animation]?.stop(); };
     }, [actions, animation]);
 
+    // Avoid object literal {x,y,z} allocation in the signature
     const rotateBone = (boneName, value, slerpFactor, flipX = 1, flipY = 1, flipZ = 1) => {
         const bone = userData.vrm?.humanoid.getNormalizedBoneNode(boneName);
         if (!bone) return;
@@ -112,8 +112,10 @@ export const VRMavatar = ({ avatar, ...props }) => {
         applyMpToThree(startLm, tmpV2);
         applyMpToThree(endLm, tmpV3);
 
-        if (tmpV4.subVectors(tmpV3, tmpV2).lengthSq() < 0.001) return;
-        const targetLocalDir = tmpV4.normalize();
+        //####new line#####
+        if (tmpV4.subVectors(tmpV3, tmpV2).lengthSq() < 0.0001) return;
+
+        const targetLocalDir = tmpV4.subVectors(tmpV3, tmpV2).normalize();
 
         tmpQ1.identity();
         if (bone.parent) bone.parent.getWorldQuaternion(tmpQ1);
@@ -142,13 +144,16 @@ export const VRMavatar = ({ avatar, ...props }) => {
         applyMpToThree(wristLm, tmpV3);
 
         const upperDir = tmpV4.subVectors(tmpV2, tmpV1).normalize();
+
+        // Re-use tmpV1 since we are done with the shoulder
         const lowerDir = tmpV1.subVectors(tmpV3, tmpV2).normalize();
 
         const SHOULDER_BIAS = 0.6;
         upperDir.x *= (1 - SHOULDER_BIAS);
         upperDir.normalize();
 
-        let upperRestDir = tmpV2;
+        // Upper arm
+        let upperRestDir = tmpV2; // Re-use
         if (upperBone.children[0]) upperRestDir.copy(upperBone.children[0].position).normalize();
         else upperRestDir.set(0, -1, 0);
 
@@ -159,7 +164,8 @@ export const VRMavatar = ({ avatar, ...props }) => {
         tmpQ2.setFromUnitVectors(upperRestDir, upperLocalDir);
         upperBone.quaternion.slerp(tmpQ2, slerpFactor);
 
-        let lowerRestDir = tmpV2;
+        // Lower arm
+        let lowerRestDir = tmpV2; // Re-use
         if (lowerBone.children[0]) lowerRestDir.copy(lowerBone.children[0].position).normalize();
         else lowerRestDir.set(0, -1, 0);
 
@@ -191,7 +197,7 @@ export const VRMavatar = ({ avatar, ...props }) => {
         if (!isRight) basisX.negate();
 
         const basisY = palmNormal;
-        const basisZ = tmpV4.crossVectors(basisX, basisY).normalize();
+        const basisZ = tmpV4.crossVectors(basisX, basisY).normalize(); // Reuse tmpV4
         basisX.crossVectors(basisY, basisZ).normalize();
 
         tmpMat.makeBasis(basisX, basisY, basisZ);
@@ -213,6 +219,7 @@ export const VRMavatar = ({ avatar, ...props }) => {
     }, [camera]);
 
     useFrame((_, delta) => {
+
         if (!userData?.vrm) return;
         const vrm = userData.vrm;
 
@@ -220,7 +227,7 @@ export const VRMavatar = ({ avatar, ...props }) => {
         vrm.expressionManager.setValue("sad",   sad);
         vrm.expressionManager.setValue("happy", happy);
 
-        const safeDelta = Math.min(delta, 1 / 30);
+        const safeDelta = Math.min(delta, 1 / 30); // Cap delta to equivalent of 30fps
         const speed = safeDelta * 12;
 
         if (riggedFace.current) {
@@ -247,56 +254,46 @@ export const VRMavatar = ({ avatar, ...props }) => {
         const raw = rawResults.current;
         if (!raw) { vrm.update(delta); return; }
 
-        // Arms update every frame (less math, critical for overall stance)
         if (raw.poseLandmarks) {
             const pl = raw.poseLandmarks;
             applyArmFK("leftUpperArm",  "leftLowerArm",  pl[11], pl[13], pl[15], speed);
             applyArmFK("rightUpperArm", "rightLowerArm", pl[12], pl[14], pl[16], speed);
         }
 
-        const applyFingers = (prefix, lms, slerpSpeed) => {
+        if (raw.leftHandLandmarks) {
+            applyWristOrientation("leftHand",  "leftLowerArm",  raw.leftHandLandmarks,  false, speed);
+        }
+        if (raw.rightHandLandmarks) {
+            applyWristOrientation("rightHand", "rightLowerArm", raw.rightHandLandmarks, true,  speed);
+        }
+
+        const applyFingers = (prefix, lms) => {
             if (!lms) return;
             const maxBend = 5;
 
-            applyDirectFK(`${prefix}ThumbMetacarpal`, lms[1], lms[2], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}ThumbProximal`, lms[2], lms[3], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}ThumbDistal`, lms[3], lms[4], slerpSpeed, maxBend);
+            applyDirectFK(`${prefix}ThumbMetacarpal`, lms[1], lms[2], speed, maxBend);
+            applyDirectFK(`${prefix}ThumbProximal`, lms[2], lms[3], speed, maxBend);
+            applyDirectFK(`${prefix}ThumbDistal`, lms[3], lms[4], speed, maxBend);
 
-            applyDirectFK(`${prefix}IndexProximal`, lms[5], lms[6], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}IndexIntermediate`, lms[6], lms[7], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}IndexDistal`, lms[7], lms[8], slerpSpeed, maxBend);
+            applyDirectFK(`${prefix}IndexProximal`, lms[5], lms[6], speed, maxBend);
+            applyDirectFK(`${prefix}IndexIntermediate`, lms[6], lms[7], speed, maxBend);
+            applyDirectFK(`${prefix}IndexDistal`, lms[7], lms[8], speed, maxBend);
 
-            applyDirectFK(`${prefix}MiddleProximal`, lms[9], lms[10], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}MiddleIntermediate`, lms[10], lms[11], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}MiddleDistal`, lms[11], lms[12], slerpSpeed, maxBend);
+            applyDirectFK(`${prefix}MiddleProximal`, lms[9], lms[10], speed, maxBend);
+            applyDirectFK(`${prefix}MiddleIntermediate`, lms[10], lms[11], speed, maxBend);
+            applyDirectFK(`${prefix}MiddleDistal`, lms[11], lms[12], speed, maxBend);
 
-            applyDirectFK(`${prefix}RingProximal`, lms[13], lms[14], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}RingIntermediate`, lms[14], lms[15], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}RingDistal`, lms[15], lms[16], slerpSpeed, maxBend);
+            applyDirectFK(`${prefix}RingProximal`, lms[13], lms[14], speed, maxBend);
+            applyDirectFK(`${prefix}RingIntermediate`, lms[14], lms[15], speed, maxBend);
+            applyDirectFK(`${prefix}RingDistal`, lms[15], lms[16], speed, maxBend);
 
-            applyDirectFK(`${prefix}LittleProximal`, lms[17], lms[18], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}LittleIntermediate`, lms[18], lms[19], slerpSpeed, maxBend);
-            applyDirectFK(`${prefix}LittleDistal`, lms[19], lms[20], slerpSpeed, maxBend);
+            applyDirectFK(`${prefix}LittleProximal`, lms[17], lms[18], speed, maxBend);
+            applyDirectFK(`${prefix}LittleIntermediate`, lms[18], lms[19], speed, maxBend);
+            applyDirectFK(`${prefix}LittleDistal`, lms[19], lms[20], speed, maxBend);
         };
 
-        // --- TIME-SLICING FOR PERFORMANCE ---
-        frameCount.current = (frameCount.current + 1) % 2;
-
-        // Because we only update half the time, we double the slerp speed
-        // to ensure the hands don't start feeling sluggish.
-        const slicedSpeed = speed * 2;
-
-        if (frameCount.current === 0) {
-            if (raw.leftHandLandmarks) {
-                applyWristOrientation("leftHand", "leftLowerArm", raw.leftHandLandmarks, false, slicedSpeed);
-                applyFingers("left", raw.leftHandLandmarks, slicedSpeed);
-            }
-        } else {
-            if (raw.rightHandLandmarks) {
-                applyWristOrientation("rightHand", "rightLowerArm", raw.rightHandLandmarks, true, slicedSpeed);
-                applyFingers("right", raw.rightHandLandmarks, slicedSpeed);
-            }
-        }
+        applyFingers("left",  raw.leftHandLandmarks);
+        applyFingers("right", raw.rightHandLandmarks);
 
         vrm.update(delta);
     });
