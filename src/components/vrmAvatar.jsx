@@ -232,11 +232,11 @@ export const VRMavatar = ({ avatar, ...props }) => {
 
         if (riggedFace.current) {
             const face = riggedFace.current;
-            rotateBone("neck", face.head, delta * 5, -0.7, 0.7, 0.7);
-            rotateBone("head", face.head, delta * 5, 0.7, 0.7, 0.7);
+            rotateBone("neck", face.head, delta * 5, 0.7, -0.7, -0.7);
+            rotateBone("head", face.head, delta * 5, 0.7, -0.7, -0.7);
 
-            vrm.expressionManager.setValue("blinkLeft", Math.max(0, 1 - face.eye.l));
-            vrm.expressionManager.setValue("blinkRight", Math.max(0, 1 - face.eye.r));
+            vrm.expressionManager.setValue("blinkLeft", Math.max(0, 1 - face.eye.r));
+            vrm.expressionManager.setValue("blinkRight", Math.max(0, 1 - face.eye.l));
 
             vrm.expressionManager.setValue("aa", face.mouth.shape.A);
             vrm.expressionManager.setValue("ee", face.mouth.shape.E);
