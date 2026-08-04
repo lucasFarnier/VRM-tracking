@@ -20,27 +20,10 @@ const tmpQ1 = new Quaternion();
 const tmpQ2 = new Quaternion();
 const identityQ = new Quaternion(); // Always stays 0,0,0,1
 
-const leftWristTarget = new Vector3();
-const rightWristTarget = new Vector3();
-
 // Re-uses a target Vector3 instead of creating a new one
 const applyMpToThree = (l, target) => target.set(l.x, -l.y, -l.z);
 
 export const VRMavatar = ({ avatar, ...props }) => {
-    const getFusedWrist = ( poseWrist, handLandmarks, target) => {
-        if (!poseWrist) return null;
-
-        applyMpToThree(poseWrist, target);
-
-        if (handLandmarks?.length) {
-            applyMpToThree(handLandmarks[0], tmpV4);
-
-            target.lerp(tmpV4, 0.75);
-        }
-
-        return target;
-    };
-
     const { scene, userData } = useGLTF(`models/${avatar}`, undefined, undefined, (loader) => {
         loader.register((parser) => new VRMLoaderPlugin(parser));
     });
@@ -150,119 +133,48 @@ export const VRMavatar = ({ avatar, ...props }) => {
         bone.quaternion.slerp(tmpQ2, slerpFactor);
     };
 
-    const applyArmFK = (
-        shoulderBoneName,
-        upperName,
-        lowerName,
-        shoulderLm,
-        elbowLm,
-        wristTarget,
-        slerpFactor
-    ) => {
-
-        if (!shoulderLm || !elbowLm || !wristTarget) return;
-
-        const shoulderBone =
-            userData.vrm?.humanoid.getNormalizedBoneNode(
-                shoulderBoneName
-            );
-
-        const upperBone =
-            userData.vrm?.humanoid.getNormalizedBoneNode(
-                upperName
-            );
-
-        const lowerBone =
-            userData.vrm?.humanoid.getNormalizedBoneNode(
-                lowerName
-            );
-
-        if (!shoulderBone || !upperBone || !lowerBone) return;
+    const applyArmFK = (upperName, lowerName, shoulderLm, elbowLm, wristLm, slerpFactor) => {
+        if (!shoulderLm || !elbowLm || !wristLm) return;
+        const upperBone = userData.vrm?.humanoid.getNormalizedBoneNode(upperName);
+        const lowerBone = userData.vrm?.humanoid.getNormalizedBoneNode(lowerName);
+        if (!upperBone || !lowerBone) return;
 
         applyMpToThree(shoulderLm, tmpV1);
         applyMpToThree(elbowLm, tmpV2);
+        applyMpToThree(wristLm, tmpV3);
 
-        const upperDir =
-            tmpV3.subVectors(
-                tmpV2,
-                tmpV1
-            ).normalize();
+        const upperDir = tmpV4.subVectors(tmpV2, tmpV1).normalize();
 
-        const lowerDir =
-            tmpV4.subVectors(
-                wristTarget,
-                tmpV2
-            ).normalize();
+        // Re-use tmpV1 since we are done with the shoulder
+        const lowerDir = tmpV1.subVectors(tmpV3, tmpV2).normalize();
 
-        let upperRestDir = new Vector3();
+        const SHOULDER_BIAS = 0.6;
+        upperDir.x *= (1 - SHOULDER_BIAS);
+        upperDir.normalize();
 
-        if (upperBone.children[0]) {
-            upperRestDir
-                .copy(
-                    upperBone.children[0].position
-                )
-                .normalize();
-        } else {
-            upperRestDir.set(1,0,0);
-        }
+        // Upper arm
+        let upperRestDir = tmpV2; // Re-use
+        if (upperBone.children[0]) upperRestDir.copy(upperBone.children[0].position).normalize();
+        else upperRestDir.set(0, -1, 0);
 
         tmpQ1.identity();
+        if (upperBone.parent) upperBone.parent.getWorldQuaternion(tmpQ1);
 
-        if (upperBone.parent) {
-            upperBone.parent.getWorldQuaternion(tmpQ1);
-        }
+        const upperLocalDir = upperDir.applyQuaternion(tmpQ1.invert());
+        tmpQ2.setFromUnitVectors(upperRestDir, upperLocalDir);
+        upperBone.quaternion.slerp(tmpQ2, slerpFactor);
 
-        const upperLocal =
-            upperDir.clone()
-                .applyQuaternion(
-                    tmpQ1.invert()
-                );
+        // Lower arm
+        let lowerRestDir = tmpV2; // Re-use
+        if (lowerBone.children[0]) lowerRestDir.copy(lowerBone.children[0].position).normalize();
+        else lowerRestDir.set(0, -1, 0);
 
-        tmpQ2.setFromUnitVectors(
-            upperRestDir,
-            upperLocal
-        );
-
-        upperBone.quaternion.slerp(
-            tmpQ2,
-            slerpFactor
-        );
-
-        let lowerRestDir = new Vector3();
-
-        if (lowerBone.children[0]) {
-            lowerRestDir
-                .copy(
-                    lowerBone.children[0].position
-                )
-                .normalize();
-        } else {
-            lowerRestDir.set(1,0,0);
-        }
-
+        tmpQ1.identity();
         upperBone.getWorldQuaternion(tmpQ1);
 
-        const lowerLocal =
-            lowerDir.clone()
-                .applyQuaternion(
-                    tmpQ1.invert()
-                );
-
-        tmpQ2.setFromUnitVectors(
-            lowerRestDir,
-            lowerLocal
-        );
-
-        lowerBone.quaternion.slerp(
-            tmpQ2,
-            slerpFactor
-        );
-
-        shoulderBone.rotation.z =
-            upperBone.rotation.z * 0.35;
-
-        shoulderBone.rotation.x =
-            upperBone.rotation.x * 0.2;
+        const lowerLocalDir = lowerDir.applyQuaternion(tmpQ1.invert());
+        tmpQ2.setFromUnitVectors(lowerRestDir, lowerLocalDir);
+        lowerBone.quaternion.slerp(tmpQ2, slerpFactor);
     };
 
     const applyWristOrientation = (boneName, lowerArmName, landmarks, isRight, slerpFactor) => {
@@ -343,11 +255,9 @@ export const VRMavatar = ({ avatar, ...props }) => {
         if (!raw) { vrm.update(delta); return; }
 
         if (raw.poseLandmarks) {
-            const pl = raw.poseWorldLandmarks || raw.poseLandmarks;
-            getFusedWrist(pl[15], raw.leftHandLandmarks, leftWristTarget);
-            applyArmFK("leftShoulder", "leftUpperArm", "leftLowerArm", pl[11], pl[13], leftWristTarget, speed);
-            getFusedWrist(pl[16], raw.rightHandLandmarks, rightWristTarget);
-            applyArmFK("rightShoulder", "rightUpperArm", "rightLowerArm", pl[12], pl[14], rightWristTarget, speed);
+            const pl = raw.poseLandmarks;
+            applyArmFK("leftUpperArm",  "leftLowerArm",  pl[11], pl[13], pl[15], speed);
+            applyArmFK("rightUpperArm", "rightLowerArm", pl[12], pl[14], pl[16], speed);
         }
 
         if (raw.leftHandLandmarks) {

@@ -6,6 +6,20 @@ import { useVideoRecognition } from "../hooks/useVideoRecognition";
 // --- MOBILE DETECTION (computed once at module load) ---
 const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
+// Module-level guard against React 18 StrictMode's dev-only double-invoke
+// of effects (mount -> cleanup -> mount). The old guard checked the Zustand
+// store's `videoElement`, but the cleanup function resets that to null
+// *before* the second mount runs, so it never actually blocked anything --
+// a second Holistic/WASM instance got constructed every time, which is what
+// caused the "Cannot read properties of undefined" / EEXIST / WASM abort
+// crash and the resulting "no tracking at all".
+//
+// This flag lives outside the component/module render cycle entirely, so
+// it survives StrictMode's synthetic unmount+remount and correctly prevents
+// a second Holistic instance from ever being constructed while one is
+// already alive.
+let holisticInstanceActive = false;
+
 export const CameraWidget = () => {
     // `visible` now only controls whether the preview UI is shown/hidden.
     // It no longer starts/stops the camera or Mediapipe pipeline — those
@@ -24,9 +38,11 @@ export const CameraWidget = () => {
     // component — webcam stays active and tracking keeps running whether
     // or not the preview is shown. Only torn down on unmount.
     useEffect(() => {
-        if (useVideoRecognition.getState().videoElement) {
+        if (holisticInstanceActive) {
             return;
         }
+        holisticInstanceActive = true;
+
         setVideoElement(videoElement.current);
 
         const holistic = new Holistic({
@@ -64,6 +80,7 @@ export const CameraWidget = () => {
             holisticRef.current?.close();
             holisticRef.current = null;
             setVideoElement(null);
+            holisticInstanceActive = false;
         };
     }, []);
 
