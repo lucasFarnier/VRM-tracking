@@ -128,7 +128,7 @@ const estimateZFromHandScale = (handLms, poseLms, side, sensitivity = 1.0) => {
     // Perspective: size ∝ 1/distance.
     // We treat the baseline depth as Z ≈ 0 (roughly shoulder depth).
     // Positive Z = closer to camera (in front of body).
-    const D_REF = -0.5; // metres; tunes how far the hand travels in Z
+    const D_REF = 0.5; // metres; tunes how far the hand travels in Z
     let z = D_REF * (1 - baseline / ratio) * sensitivity;
 
     return clamp(z, SIGNING_SPACE_Z_MIN / ARM_SPAN_SCALE, SIGNING_SPACE_Z_MAX / ARM_SPAN_SCALE);
@@ -284,7 +284,7 @@ export const VRMavatar = ({ avatar, ...props }) => {
         happy: { value: 0, min: 0, max: 1 },
         animation: { options: ["None", "Idle", "Swing Dancing", "Thriller Part 2"], value: "Idle" },
         showDebug: { value: true, label: "Show IK targets" },
-        zSensitivity: { value: 1.0, min: 0, max: 3, step: 0.1, label: "Z depth sensitivity" },
+        zSensitivity: { value: -0.6, min: -1, max: 1, step: 0.1, label: "Z depth sensitivity" },
     });
 
     useEffect(() => {
@@ -350,7 +350,7 @@ export const VRMavatar = ({ avatar, ...props }) => {
             // Fall back to MediaPipe's native Z (relative, less accurate)
             const rawDeltaZ = lm.z - shoulderLm.z;
             const smoothedDeltaZ = smoothZ(smoothKey, rawDeltaZ);
-            localZ = smoothedDeltaZ;
+            localZ = smoothedDeltaZ-1;
         }
         localZ = clamp(localZ, SIGNING_SPACE_Z_MIN / ARM_SPAN_SCALE, SIGNING_SPACE_Z_MAX / ARM_SPAN_SCALE);
 
