@@ -75,6 +75,66 @@ const smoothZ = (key, rawZ) => {
     return next;
 };
 
+
+// --- SCALE-BASED FORWARD/BACKWARD DEPTH ESTIMATION ---
+// MediaPipe Z is noisy and relative. We use perspective: apparent size ∝ 1/distance.
+// Face width (eye-to-eye) is our stable ruler. Hand width (wrist → middle MCP)
+// changes reliably as the hand moves toward/away from the camera.
+
+const HAND_BASELINE = { left: null, right: null };
+const BASELINE_ALPHA = 0.03; // very slow adaptation so it doesn't chase motion
+
+const getHandScale = (handLms) => {
+    if (!handLms || handLms.length < 10) return 0;
+    const wrist = handLms[0];
+    const middleMCP = handLms[9];
+    if (!wrist || !middleMCP) return 0;
+    return Math.hypot(wrist.x - middleMCP.x, wrist.y - middleMCP.y);
+};
+
+const getFaceScale = (poseLms) => {
+    if (!poseLms || poseLms.length < 6) return 0;
+    const leftEye = poseLms[2];   // MediaPipe Pose indices
+    const rightEye = poseLms[5];
+    if (!leftEye || !rightEye) return 0;
+    return Math.hypot(leftEye.x - rightEye.x, leftEye.y - rightEye.y);
+};
+
+const estimateZFromHandScale = (handLms, poseLms, side, sensitivity = 1.0) => {
+    const handSize = getHandScale(handLms);
+    const faceSize = getFaceScale(poseLms);
+    if (handSize < 0.001 || faceSize < 0.001) return null;
+
+    const ratio = handSize / faceSize;
+    const sideKey = side === "left" ? "left" : "right";
+
+    // First-frame init
+    if (HAND_BASELINE[sideKey] === null) {
+        HAND_BASELINE[sideKey] = ratio;
+        return null; // need a few frames to stabilise
+    }
+
+    // Slowly adapt baseline only when the ratio is stable (within 20 %).
+    // This prevents the baseline from drifting when you hold your hand
+    // forward for a long time.
+    const deviation = Math.abs(ratio - HAND_BASELINE[sideKey]) / HAND_BASELINE[sideKey];
+    if (deviation < 0.2) {
+        HAND_BASELINE[sideKey] =
+            HAND_BASELINE[sideKey] * (1 - BASELINE_ALPHA) + ratio * BASELINE_ALPHA;
+    }
+
+    const baseline = HAND_BASELINE[sideKey];
+
+    // Perspective: size ∝ 1/distance.
+    // We treat the baseline depth as Z ≈ 0 (roughly shoulder depth).
+    // Positive Z = closer to camera (in front of body).
+    const D_REF = -0.5; // metres; tunes how far the hand travels in Z
+    let z = D_REF * (1 - baseline / ratio) * sensitivity;
+
+    return clamp(z, SIGNING_SPACE_Z_MIN / ARM_SPAN_SCALE, SIGNING_SPACE_Z_MAX / ARM_SPAN_SCALE);
+};
+
+
 // ---------------------------------------------------------------------------
 // REST-DIRECTION AUTO-DETECTION
 // VRM normalised humanoid bones almost always point toward their child along
@@ -218,12 +278,13 @@ export const VRMavatar = ({ avatar, ...props }) => {
 
     useEffect(() => { setResultsCallback(resultsCallback); }, [resultsCallback, setResultsCallback]);
 
-    const { angry, sad, happy, animation, showDebug } = useControls("vrm", {
+    const { angry, sad, happy, animation, showDebug, zSensitivity } = useControls("vrm", {
         angry: { value: 0, min: 0, max: 1 },
         sad: { value: 0, min: 0, max: 1 },
         happy: { value: 0, min: 0, max: 1 },
         animation: { options: ["None", "Idle", "Swing Dancing", "Thriller Part 2"], value: "Idle" },
         showDebug: { value: true, label: "Show IK targets" },
+        zSensitivity: { value: 1.0, min: 0, max: 3, step: 0.1, label: "Z depth sensitivity" },
     });
 
     useEffect(() => {
@@ -278,22 +339,23 @@ export const VRMavatar = ({ avatar, ...props }) => {
     // -----------------------------------------------------------------------
     // FIXED landmark → world-target conversion
     // -----------------------------------------------------------------------
-    const landmarkToWorldTarget = (lm, shoulderLm, anchorWorldPos, out, smoothKey) => {
+    const landmarkToWorldTarget = (lm, shoulderLm, anchorWorldPos, out, smoothKey, zOverride = null) => {
         if (!lm || !shoulderLm) return null;
 
-        const rawDeltaZ = lm.z - shoulderLm.z;
-        const smoothedDeltaZ = smoothZ(smoothKey, rawDeltaZ);
-
-        // FIX 1: Remove the erroneous negation on Z.
-        // MediaPipe z is positive toward the camera; our world space defines
-        // positive Z as "in front of the body", so we keep the sign.
-        let localZ = smoothedDeltaZ;
+        let localZ;
+        if (zOverride !== null) {
+            // Use the scale-based depth estimate (smoothed on its own key)
+            localZ = smoothZ(smoothKey + "_scaleZ", zOverride);
+        } else {
+            // Fall back to MediaPipe's native Z (relative, less accurate)
+            const rawDeltaZ = lm.z - shoulderLm.z;
+            const smoothedDeltaZ = smoothZ(smoothKey, rawDeltaZ);
+            localZ = smoothedDeltaZ;
+        }
         localZ = clamp(localZ, SIGNING_SPACE_Z_MIN / ARM_SPAN_SCALE, SIGNING_SPACE_Z_MAX / ARM_SPAN_SCALE);
 
-        // FIX 2: Mirror X if the webcam feed is mirrored (default true).
         let localX = lm.x - shoulderLm.x;
         if (MIRROR_LANDMARKS_X) localX = -localX;
-
         const localY = Y_SIGN * -(lm.y - shoulderLm.y);
 
         tmpV3.set(localX, localY, localZ);
@@ -301,26 +363,33 @@ export const VRMavatar = ({ avatar, ...props }) => {
         return out;
     };
 
-    const applyArmIK = (upperName, lowerName, handName, shoulderLm, elbowLm, wristLm, slerpFactor, sideKey) => {
+    const applyArmIK = (upperName, lowerName, handName, shoulderLm, elbowLm, wristLm, handLms, slerpFactor, sideKey, zSensitivity) => {
         if (!shoulderLm || !elbowLm || !wristLm) return;
         const upperBone = userData.vrm?.humanoid.getNormalizedBoneNode(upperName);
         const lowerBone = userData.vrm?.humanoid.getNormalizedBoneNode(lowerName);
         const handBone = userData.vrm?.humanoid.getNormalizedBoneNode(handName);
         if (!upperBone || !lowerBone || !handBone) return;
 
-        // FIX 3: Auto-detect rest direction from the actual skeleton instead
-        // of guessing (1,0,0) or (-1,0,0).
         const restDir = detectRestDir(upperBone);
-
         upperBone.getWorldPosition(ikShoulderAnchorPos);
 
-        const target = landmarkToWorldTarget(wristLm, shoulderLm, ikShoulderAnchorPos, ikTargetLocal, `${sideKey}Wrist`);
-        const pole = landmarkToWorldTarget(elbowLm, shoulderLm, ikShoulderAnchorPos, ikPoleLocal, `${sideKey}Elbow`);
+        // Compute scale-based Z override from hand landmarks
+        const zOverride = estimateZFromHandScale(
+            handLms,
+            rawResults.current?.poseLandmarks,
+            sideKey,
+            zSensitivity
+        );
+
+        const target = landmarkToWorldTarget(
+            wristLm, shoulderLm, ikShoulderAnchorPos, ikTargetLocal, `${sideKey}Wrist`, zOverride
+        );
+        const pole = landmarkToWorldTarget(
+            elbowLm, shoulderLm, ikShoulderAnchorPos, ikPoleLocal, `${sideKey}Elbow`
+        );
         if (!target) return;
 
         solveTwoBoneIK(upperBone, lowerBone, handBone, target, pole, slerpFactor, restDir);
-
-        // Return target so we can optionally draw a debug sphere
         return target.clone();
     };
 
@@ -430,15 +499,15 @@ export const VRMavatar = ({ avatar, ...props }) => {
         if (raw.poseLandmarks) {
             const pl = raw.poseLandmarks;
 
-            // Left arm
             debugTargets.left = applyArmIK(
                 "leftUpperArm", "leftLowerArm", "leftHand",
-                pl[11], pl[13], pl[15], speed, "left"
+                pl[11], pl[13], pl[15],
+                raw.leftHandLandmarks, speed, "left", zSensitivity
             );
-            // Right arm
             debugTargets.right = applyArmIK(
                 "rightUpperArm", "rightLowerArm", "rightHand",
-                pl[12], pl[14], pl[16], speed, "right"
+                pl[12], pl[14], pl[16],
+                raw.rightHandLandmarks, speed, "right", zSensitivity
             );
         }
 
